@@ -2712,8 +2712,12 @@ Must be handled by the callers."
     default-directory)
    ;; PROC.
    ((member operation '(file-notify-rm-watch file-notify-valid-p))
-    (when (processp (nth 0 args))
-      (tramp-get-default-directory (process-buffer (nth 0 args)))))
+    (cond
+     ((processp (nth 0 args))
+      (tramp-get-default-directory (process-buffer (nth 0 args))))
+
+     ((tramp-sh-handle-file-notify-valid-p (nth 0 args))
+      (plist-get (nth 0 args) :file-name))))
    ;; VEC.
    ((member operation
 	    '(tramp-get-home-directory tramp-get-remote-gid

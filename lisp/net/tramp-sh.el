@@ -1080,8 +1080,8 @@ Format specifiers \"%s\" are replaced before the script is used.")
     ;; `file-name-sans-versions' performed by default handler.
     (file-newer-than-file-p . tramp-handle-file-newer-than-file-p)
     (file-notify-add-watch . tramp-sh-handle-file-notify-add-watch)
-    (file-notify-rm-watch . tramp-handle-file-notify-rm-watch)
-    (file-notify-valid-p . tramp-handle-file-notify-valid-p)
+    (file-notify-rm-watch . tramp-sh-handle-file-notify-rm-watch)
+    (file-notify-valid-p . tramp-sh-handle-file-notify-valid-p)
     (file-ownership-preserved-p . tramp-sh-handle-file-ownership-preserved-p)
     (file-readable-p . tramp-sh-handle-file-readable-p)
     (file-regular-p . tramp-handle-file-regular-p)
@@ -3806,83 +3806,137 @@ Fall back to normal file name handler if no Tramp handler exists."
 	;; quoted, we don't do anything.
 	(tramp-run-real-handler operation args)))))
 
+(defun tramp-sh-file-notify-start-process (v files flags)
+  (let ((process-environment (cons "GIO_USE_FILE_MONITOR=help" process-environment))
+        command events filter p sequence)
+    (cond
+     ;; "inotifywait".
+     ((setq command (tramp-get-remote-inotifywait v))
+	    (setq filter #'tramp-sh-inotifywait-process-filter
+	          events
+	          (cond
+	           ((and (memq 'change flags) (memq 'attribute-change flags))
+		          (concat "create,modify,move,moved_from,moved_to,move_self,"
+			                "delete,delete_self,attrib,ignored"))
+	           ((memq 'change flags)
+		          (concat "create,modify,move,moved_from,moved_to,move_self,"
+			                "delete,delete_self,ignored"))
+	           ((memq 'attribute-change flags) "attrib,ignored"))
+	          ;; "-P" has been added to version 3.21, so we cannot assume it yet.
+	          sequence `(,command "-mq" "-e" ,events ,@files)
+	          ;; Make events a list of symbols.
+	          events
+	          (mapcar
+	           (lambda (x) (intern-soft (tramp-compat-string-replace "_" "-" x)))
+	           (split-string events "," 'omit))))
+     ;; "gio monitor".
+     ((setq command (tramp-get-remote-gio-monitor v))
+	    (setq filter #'tramp-sh-gio-monitor-process-filter
+	          events
+	          (cond
+	           ((and (memq 'change flags) (memq 'attribute-change flags))
+		          '(created changed changes-done-hint moved deleted
+			                  attribute-changed))
+	           ((memq 'change flags)
+		          '(created changed changes-done-hint moved deleted))
+	           ((memq 'attribute-change flags) '(attribute-changed)))
+	          sequence `(,command "monitor" ,@files)))
+     ;; None.
+     (t (tramp-error
+	       v 'file-notify-error
+	       "No file notification program found")))
+    ;; Start process.
+    (setq p (apply
+	           #'start-file-process
+	           (file-name-nondirectory command)
+	           (generate-new-buffer
+		          (format " *%s*" (file-name-nondirectory command)))
+	           sequence))
+    ;; Return the process object as watch-descriptor.
+    (if (not (processp p))
+	      (tramp-error
+	       v 'file-notify-error
+	       "`%s' failed to start on remote host"
+	       (string-join sequence " "))
+	    (tramp-message v 6 "Run `%s', %S" (string-join sequence " ") p)
+	    (process-put p 'tramp-vector v)
+	    ;; This is needed for ssh or PuTTY based processes, and only if
+	    ;; the respective options are set.  Perhaps, the setting could
+	    ;; be more fine-grained.
+	    ;; (process-put p 'tramp-shared-socket t)
+	    ;; Needed for process filter.
+	    (process-put p 'tramp-events events)
+      ;; TODO What to put here instead of localname?
+	    ;; (process-put p 'tramp-watch-name localname)
+      (process-put p 'tramp-watch-files files)
+	    (set-process-query-on-exit-flag p nil)
+	    (set-process-filter p filter)
+	    (set-process-sentinel p #'tramp-file-notify-process-sentinel)
+	    ;; There might be an error if the monitor is not supported.
+	    ;; Give the filter a chance to read the output.
+	    (while (tramp-accept-process-output p))
+	    (unless (process-live-p p)
+	      (tramp-error
+	       p 'file-notify-error "Monitoring not supported"))
+	    p)))
+
+(defun tramp-sh-file-notify-refresh-processes* (v)
+  (let* ((processes (tramp-get-connection-property v "file-notify-processes"))
+         (watch-lists (tramp-get-connection-property v "file-notify-watch-lists"))
+         (all-flags (delete-dups (append (mapcar #'car processes) (mapcar #'car watch-lists)))))
+    (dolist (flags all-flags)
+      (let ((process (cdr (assoc flags processes)))
+            (watch-list (cdr (assoc flags watch-lists))))
+        (cond ((and watch-list (null process))
+               (let ((p (tramp-sh-file-notify-start-process v watch-list flags)))
+                 (push (cons flags p) processes)))
+
+              ((and (null watch-list) process)
+               (tramp-handle-file-notify-rm-watch process))
+
+              ((and watch-list process)
+               (tramp-handle-file-notify-rm-watch process)
+               (let ((p (tramp-sh-file-notify-start-process v watch-list flags)))
+                 (push (cons flags p) processes))))))
+    (tramp-set-connection-property v "file-notify-processes" processes)))
+
+(defvar tramp-sh-file-notify-refresh-debounce-timer nil)
+
+(defun tramp-sh-file-notify-refresh-processes (v)
+  (when tramp-sh-file-notify-refresh-debounce-timer
+    (cancel-timer tramp-sh-file-notify-refresh-debounce-timer))
+  (setq tramp-sh-file-notify-refresh-debounce-timer
+        (run-at-time 0.1 nil (lambda (&rest _) (tramp-sh-file-notify-refresh-processes* v)))))
+
 (defun tramp-sh-handle-file-notify-add-watch (file-name flags _callback)
   "Like `file-notify-add-watch' for Tramp files."
   (setq file-name (expand-file-name file-name))
   (with-parsed-tramp-file-name file-name nil
-    (let ((default-directory (file-name-directory file-name))
-          (process-environment
-           (cons "GIO_USE_FILE_MONITOR=help" process-environment))
-	  command events filter p sequence)
-      (cond
-       ;; "inotifywait".
-       ((setq command (tramp-get-remote-inotifywait v))
-	(setq filter #'tramp-sh-inotifywait-process-filter
-	      events
-	      (cond
-	       ((and (memq 'change flags) (memq 'attribute-change flags))
-		(concat "create,modify,move,moved_from,moved_to,move_self,"
-			"delete,delete_self,attrib,ignored"))
-	       ((memq 'change flags)
-		(concat "create,modify,move,moved_from,moved_to,move_self,"
-			"delete,delete_self,ignored"))
-	       ((memq 'attribute-change flags) "attrib,ignored"))
-	      ;; "-P" has been added to version 3.21, so we cannot assume it yet.
-	      sequence `(,command "-mq" "-e" ,events ,localname)
-	      ;; Make events a list of symbols.
-	      events
-	      (mapcar
-	       (lambda (x) (intern-soft (tramp-compat-string-replace "_" "-" x)))
-	       (split-string events "," 'omit))))
-       ;; "gio monitor".
-       ((setq command (tramp-get-remote-gio-monitor v))
-	(setq filter #'tramp-sh-gio-monitor-process-filter
-	      events
-	      (cond
-	       ((and (memq 'change flags) (memq 'attribute-change flags))
-		'(created changed changes-done-hint moved deleted
-			  attribute-changed))
-	       ((memq 'change flags)
-		'(created changed changes-done-hint moved deleted))
-	       ((memq 'attribute-change flags) '(attribute-changed)))
-	      sequence `(,command "monitor" ,localname)))
-       ;; None.
-       (t (tramp-error
-	   v 'file-notify-error
-	   "No file notification program found on %s"
-	   (file-remote-p file-name))))
-      ;; Start process.
-      (setq p (apply
-	       #'start-file-process
-	       (file-name-nondirectory command)
-	       (generate-new-buffer
-		(format " *%s*" (file-name-nondirectory command)))
-	       sequence))
-      ;; Return the process object as watch-descriptor.
-      (if (not (processp p))
-	  (tramp-error
-	   v 'file-notify-error
-	   "`%s' failed to start on remote host"
-	   (string-join sequence " "))
-	(tramp-message v 6 "Run `%s', %S" (string-join sequence " ") p)
-	(process-put p 'tramp-vector v)
-	;; This is needed for ssh or PuTTY based processes, and only if
-	;; the respective options are set.  Perhaps, the setting could
-	;; be more fine-grained.
-	;; (process-put p 'tramp-shared-socket t)
-	;; Needed for process filter.
-	(process-put p 'tramp-events events)
-	(process-put p 'tramp-watch-name localname)
-	(set-process-query-on-exit-flag p nil)
-	(set-process-filter p filter)
-	(set-process-sentinel p #'tramp-file-notify-process-sentinel)
-	;; There might be an error if the monitor is not supported.
-	;; Give the filter a chance to read the output.
-	(while (tramp-accept-process-output p))
-	(unless (process-live-p p)
-	  (tramp-error
-	   p 'file-notify-error "Monitoring not supported for `%s'" file-name))
-	p))))
+    (let* ((watch-lists (tramp-get-connection-property v "file-notify-watch-lists"))
+           (watch-list (cdr (assoc flags watch-lists))))
+      (if watch-list
+          (setcdr watch-list (delete-dups (cons localname (cdr watch-list))))
+        (push (cons flags (list localname)) watch-lists))
+      (tramp-set-connection-property v "file-notify-watch-lists" watch-lists)
+      (tramp-sh-file-notify-refresh-processes v)
+      (list :file-name file-name
+            :flags flags))))
+
+(defun tramp-sh-handle-file-notify-rm-watch (descriptor)
+  (let ((flags (plist-get descriptor :flags))
+        (file-name (plist-get descriptor :file-name)))
+    (with-parsed-tramp-file-name file-name nil
+      (let* ((watch-lists (tramp-get-connection-property v "file-notify-watch-lists" nil))
+             (watch-list (cdr (assoc flags watch-lists))))
+        (when watch-list
+          (delq localname watch-list))
+        (tramp-set-connection-property v "file-notify-watch-lists" watch-lists)
+        (tramp-sh-file-notify-refresh-processes v)))))
+
+(defun tramp-sh-handle-file-notify-valid-p (descriptor)
+  (and (listp descriptor)
+       (plist-get descriptor :file-name)
+       (plist-get descriptor :flags)))
 
 (defun tramp-sh-gio-monitor-process-filter (proc string)
   "Read output from \"gio monitor\" and add corresponding `file-notify' events."
